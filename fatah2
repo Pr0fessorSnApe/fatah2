@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""
+Fatah2 — Multi-stage subdomain & endpoint enumeration tool.
+Crafted by Pr0fessor SnApe
+
+Run:  python3 fatah2.py
+      python3 fatah2.py -d example.com
+      python3 fatah2.py --help
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from datetime import datetime
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BANNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+BANNER = r"""
+\033[1;36m
+ ███████╗ █████╗ ████████╗ █████╗ ██╗  ██╗██████╗
+ ██╔════╝██╔══██╗╚══██╔══╝██╔══██╗██║  ██║╚════██╗
+ █████╗  ███████║   ██║   ███████║███████║ █████╔╝
+ ██╔══╝  ██╔══██║   ██║   ██╔══██║██╔══██║██╔═══╝
+ ██║     ██║  ██║   ██║   ██║  ██║██║  ██║███████╗
+ ╚═╝     ╚═╝  ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝
+\033[0m
+\033[1;33m        Advanced Recon Suite  ·  v1.0.0\033[0m
+\033[0;37m        Crafted by \033[1;35mPr0fessor SnApe\033[0m
+\033[0;90m  ─────────────────────────────────────────────
+  Subdomain Discovery · Endpoint Crawl · Risk AI
+  ─────────────────────────────────────────────\033[0m
+"""
+
+USAGE_HINT = """\033[0;36m
+  Usage:
+    python3 fatah2.py                     ← interactive mode
+    python3 fatah2.py -d example.com      ← quick scan
+    python3 fatah2.py -d example.com --depth deep --format html
+    python3 fatah2.py serve               ← start REST API server
+    python3 fatah2.py --help
+\033[0m"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COLOUR HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+class C:
+    """ANSI colour codes — auto-disabled when stdout is not a tty."""
+    _tty = sys.stdout.isatty()
+
+    RESET  = "\033[0m"      if _tty else ""
+    BOLD   = "\033[1m"      if _tty else ""
+    RED    = "\033[1;31m"   if _tty else ""
+    GREEN  = "\033[1;32m"   if _tty else ""
+    YELLOW = "\033[1;33m"   if _tty else ""
+    CYAN   = "\033[1;36m"   if _tty else ""
+    PURPLE = "\033[1;35m"   if _tty else ""
+    GRAY   = "\033[0;90m"   if _tty else ""
+    WHITE  = "\033[0;37m"   if _tty else ""
+    DIM    = "\033[2m"      if _tty else ""
+
+def ok(msg):    print(f"{C.GREEN}  [✓]{C.RESET} {msg}")
+def info(msg):  print(f"{C.CYAN}  [*]{C.RESET} {msg}")
+def warn(msg):  print(f"{C.YELLOW}  [!]{C.RESET} {msg}")
+def err(msg):   print(f"{C.RED}  [✗]{C.RESET} {msg}")
+def stage(n, msg): print(f"\n{C.PURPLE}  ══ Stage {n}: {msg}{C.RESET}")
+def sep():      print(f"{C.GRAY}  {'─'*54}{C.RESET}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPENDENCY BOOTSTRAP  (installs Python deps automatically)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _bootstrap():
+    """Auto-install missing Python packages on first run."""
+    needed = {
+        "click":        "click",
+        "httpx":        "httpx",
+        "aiohttp":      "aiohttp",
+        "dns":          "dnspython",
+        "whois":        "python-whois",
+        "yaml":         "pyyaml",
+        "fastapi":      "fastapi",
+        "uvicorn":      "uvicorn[standard]",
+        "pydantic":     "pydantic",
+    }
+    missing = []
+    for mod, pkg in needed.items():
+        try:
+            __import__(mod)
+        except ImportError:
+            missing.append(pkg)
+
+    if missing:
+        warn(f"Auto-installing missing packages: {', '.join(missing)}")
+        import subprocess
+        cmd = [sys.executable, "-m", "pip", "install", "--quiet",
+               "--break-system-packages", *missing]
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            # try without flag
+            cmd2 = [sys.executable, "-m", "pip", "install", "--quiet", *missing]
+            subprocess.run(cmd2, check=True)
+        ok("Packages installed")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERACTIVE WIZARD
+# ─────────────────────────────────────────────────────────────────────────────
+
+DOMAIN_RE = re.compile(
+    r"^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$"
+)
+
+def _ask(prompt: str, default: str = "", choices: list[str] | None = None) -> str:
+    hint = f" [{default}]" if default else ""
+    chk  = f" ({'/'.join(choices)})" if choices else ""
+    while True:
+        try:
+            val = input(f"{C.CYAN}  >{C.RESET} {prompt}{chk}{hint}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            sys.exit(0)
+        val = val or default
+        if choices and val.lower() not in [c.lower() for c in choices]:
+            warn(f"Please enter one of: {', '.join(choices)}")
+            continue
+        if val:
+            return val.lower() if choices else val
+        warn("Value required.")
+
+def interactive_wizard() -> dict:
+    """Walk the user through scan options interactively."""
+    print(f"\n{C.BOLD}  ── Target Configuration ──────────────────────{C.RESET}")
+
+    # Domain
+    while True:
+        domain_raw = _ask("Enter target domain (e.g. example.com)")
+        domain = domain_raw.strip().lower() \
+            .removeprefix("http://").removeprefix("https://").split("/")[0]
+        if DOMAIN_RE.match(domain):
+            break
+        err(f"'{domain_raw}' doesn't look like a valid domain. Try again.")
+
+    print(f"\n{C.BOLD}  ── Scan Options ───────────────────────────────{C.RESET}")
+    depth = _ask("Scan depth", default="standard", choices=["quick","standard","deep"])
+
+    formats_raw = _ask("Output formats", default="json,txt,html")
+    formats = [f.strip().lower() for f in formats_raw.split(",") if f.strip()]
+
+    concurrency_raw = _ask("Concurrency (parallel workers)", default="50")
+    try:
+        concurrency = max(1, min(200, int(concurrency_raw)))
+    except ValueError:
+        concurrency = 50
+
+    print(f"\n{C.BOLD}  ── Optional API Keys (press Enter to skip) ───{C.RESET}")
+    print(f"{C.GRAY}  Keys unlock more data sources (SecurityTrails, Shodan, etc.){C.RESET}")
+    api_keys = {}
+    for name, label in [
+        ("securitytrails", "SecurityTrails"),
+        ("virustotal",     "VirusTotal"),
+        ("shodan",         "Shodan"),
+        ("github",         "GitHub token"),
+    ]:
+        try:
+            val = input(f"{C.CYAN}  >{C.RESET} {label} API key (optional): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(); sys.exit(0)
+        if val:
+            api_keys[name] = val
+
+    return {
+        "domain":      domain,
+        "depth":       depth,
+        "formats":     formats,
+        "concurrency": concurrency,
+        "api_keys":    api_keys,
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCAN RUNNER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _print_summary(result, elapsed: float):
+    stats = result.statistics
+    sep()
+    print(f"\n{C.BOLD}  SCAN COMPLETE  ·  {result.domain}{C.RESET}")
+    sep()
+    print(f"  {C.CYAN}Subdomains found :{C.RESET} {stats.get('total_subdomains', 0)}")
+    print(f"  {C.CYAN}Live hosts       :{C.RESET} {stats.get('live_hosts', 0)}")
+    print(f"  {C.CYAN}Endpoints crawled:{C.RESET} {stats.get('total_endpoints', 0)}")
+    print(f"  {C.CYAN}Duration         :{C.RESET} {elapsed:.1f}s")
+
+    # Severity breakdown
+    sev_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
+    for risk in result.risk_scores.values():
+        sev = getattr(risk, "severity", "info")
+        sev_counts[sev] = sev_counts.get(sev, 0) + 1
+
+    sep()
+    print(f"\n  {C.BOLD}Risk breakdown:{C.RESET}")
+    colors = {"critical": C.RED, "high": C.YELLOW, "medium": C.CYAN,
+              "low": C.WHITE, "info": C.GRAY}
+    for sev, count in sev_counts.items():
+        if count > 0:
+            bar = "█" * min(count, 30)
+            print(f"  {colors[sev]}{sev.upper():10}{C.RESET}  {bar} {count}")
+
+    # Top findings
+    top = sorted(
+        [(k, v) for k, v in result.risk_scores.items()
+         if hasattr(v, "severity") and v.severity in ("critical", "high")],
+        key=lambda x: getattr(x[1], "overall", 0),
+        reverse=True,
+    )[:8]
+
+    if top:
+        sep()
+        print(f"\n  {C.BOLD}{C.RED}⚑  High / Critical Findings:{C.RESET}")
+        for host, risk in top:
+            sev_color = C.RED if risk.severity == "critical" else C.YELLOW
+            print(f"\n  {sev_color}[{risk.severity.upper()}]{C.RESET}  "
+                  f"{C.BOLD}{host}{C.RESET}  (score: {risk.overall})")
+            for finding in risk.findings[:4]:
+                print(f"    {C.GRAY}↳{C.RESET} {finding}")
+
+    if result.errors:
+        sep()
+        warn(f"{len(result.errors)} scanner error(s) logged.")
+
+    sep()
+    print(f"\n  {C.GREEN}Reports saved to:{C.RESET} {C.BOLD}reports/{C.RESET}\n")
+
+
+def run_scan(domain: str, depth: str = "standard", formats: list | None = None,
+             concurrency: int = 50, timeout: int = 30, api_keys: dict | None = None,
+             output_dir: str = "reports", wordlist: str | None = None,
+             resolvers: str | None = None):
+    """Core scan entry — called by CLI, wizard, and API."""
+
+    from src.core.orchestrator import ReconOrchestrator, ScanConfig
+
+    formats = formats or ["json", "txt", "html"]
+    api_keys = api_keys or {}
+
+    config = ScanConfig(
+        domain=domain,
+        scan_depth=depth,
+        concurrency=concurrency,
+        timeout=timeout,
+        output_dir=Path(output_dir),
+        output_formats=formats,
+        wordlist=Path(wordlist) if wordlist else None,
+        resolvers=Path(resolvers) if resolvers else None,
+        enable_dns_history=True,
+        enable_http_probe=True,
+        enable_risk_scoring=True,
+        enable_whois=True,
+        api_keys=api_keys,
+    )
+
+    t0 = time.perf_counter()
+    result = asyncio.run(ReconOrchestrator(config).run())
+    elapsed = time.perf_counter() - t0
+    _print_summary(result, elapsed)
+    return result
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI  (click-based)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _print_banner():
+    # decode the escape sequences properly
+    print(BANNER.replace("\\033", "\033"))
+
+def _setup_logging(verbose: bool):
+    level = logging.DEBUG if verbose else logging.WARNING
+    logging.basicConfig(
+        level=level,
+        format="  %(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+
+def main():
+    """Main entry — routes to interactive wizard or CLI flags."""
+    import click
+
+    @click.group(invoke_without_command=True)
+    @click.option("--domain", "-d", default=None, help="Target domain")
+    @click.option("--depth",  "-D", default="standard",
+                  type=click.Choice(["quick","standard","deep"]), show_default=True)
+    @click.option("--format", "-f", default="json,txt,html",
+                  help="Output formats: json,txt,html")
+    @click.option("--concurrency", "-c", default=50, type=int, show_default=True)
+    @click.option("--timeout", "-t", default=30, type=int, show_default=True)
+    @click.option("--output-dir", "-o", default="reports", show_default=True)
+    @click.option("--wordlist", "-w", default=None)
+    @click.option("--resolvers", "-r", default=None)
+    @click.option("--api-keys", "-k", default=None,
+                  help="Path to JSON file with API keys")
+    @click.option("--verbose", "-v", is_flag=True)
+    @click.pass_context
+    def cli(ctx, domain, depth, format, concurrency, timeout,
+            output_dir, wordlist, resolvers, api_keys, verbose):
+        """
+        \b
+        Fatah2 — Advanced Recon Suite
+        Crafted by Pr0fessor SnApe
+        For authorized security assessments only.
+        """
+        if ctx.invoked_subcommand is not None:
+            return
+
+        _print_banner()
+        _setup_logging(verbose)
+
+        # ── Interactive wizard (no -d flag) ───────────────────────────────
+        if domain is None:
+            print(USAGE_HINT.replace("\\033", "\033"))
+            opts = interactive_wizard()
+            domain      = opts["domain"]
+            depth       = opts["depth"]
+            format      = ",".join(opts["formats"])
+            concurrency = opts["concurrency"]
+            api_key_data = opts["api_keys"]
+        else:
+            # Validate domain
+            d = domain.strip().lower().removeprefix("http://") \
+                .removeprefix("https://").split("/")[0]
+            if not DOMAIN_RE.match(d):
+                err(f"Invalid domain: {domain}")
+                sys.exit(1)
+            domain = d
+            # Load API keys from file if provided
+            api_key_data = {}
+            if api_keys:
+                try:
+                    with open(api_keys) as f:
+                        api_key_data = json.load(f)
+                except Exception as e:
+                    warn(f"Could not load API keys file: {e}")
+
+        formats = [x.strip() for x in format.split(",") if x.strip()]
+
+        # ── Pre-scan disclaimer ───────────────────────────────────────────
+        print(f"\n{C.YELLOW}  ⚠  Ensure you have written authorization to scan:{C.RESET}")
+        print(f"     {C.BOLD}{domain}{C.RESET}")
+        try:
+            confirm = input(f"\n{C.CYAN}  >{C.RESET} Continue? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(); sys.exit(0)
+        if confirm in ("n", "no"):
+            info("Scan cancelled.")
+            sys.exit(0)
+
+        print()
+        run_scan(
+            domain=domain,
+            depth=depth,
+            formats=formats,
+            concurrency=concurrency,
+            timeout=timeout,
+            api_keys=api_key_data,
+            output_dir=output_dir,
+            wordlist=wordlist,
+            resolvers=resolvers,
+        )
+
+    @cli.command()
+    @click.option("--host", default="0.0.0.0", show_default=True)
+    @click.option("--port", default=8080, type=int, show_default=True)
+    @click.option("--verbose", "-v", is_flag=True)
+    def serve(host, port, verbose):
+        """Start the Fatah2 REST API server."""
+        _print_banner()
+        _setup_logging(verbose)
+        try:
+            import uvicorn
+        except ImportError:
+            err("uvicorn not installed. Run: pip install uvicorn")
+            sys.exit(1)
+
+        token = os.environ.get("FATAH2_API_TOKEN")
+        if not token:
+            import secrets
+            token = secrets.token_hex(32)
+            os.environ["FATAH2_API_TOKEN"] = token
+            print(f"\n  {C.YELLOW}Generated API token:{C.RESET} {token}")
+            print(f"  {C.GRAY}Set FATAH2_API_TOKEN env var to use a fixed token{C.RESET}\n")
+
+        print(f"  {C.GREEN}API running at:{C.RESET} http://{host}:{port}")
+        print(f"  {C.GREEN}Docs at      :{C.RESET} http://{host}:{port}/api/v1/docs\n")
+        uvicorn.run(
+            "src.api.app:app",
+            host=host, port=port,
+            log_level="debug" if verbose else "warning",
+        )
+
+    cli(standalone_mode=True)
+
+
+if __name__ == "__main__":
+    _bootstrap()
+    main()
