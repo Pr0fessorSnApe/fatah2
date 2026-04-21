@@ -1,0 +1,9 @@
+{
+  "_note": "Copy to api_keys.json and fill in. NEVER commit real keys.",
+  "securitytrails": "",
+  "virustotal":     "",
+  "shodan":         "",
+  "censys_id":      "",
+  "censys_secret":  "",
+  "github":         ""
+}

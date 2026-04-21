@@ -1,0 +1,40 @@
+# ══════════════════════════════════════════════
+#  Fatah2 — Default Configuration
+#  Crafted by Pr0fessor SnApe
+#  Copy to configs/local.yaml to customise.
+# ══════════════════════════════════════════════
+
+scan:
+  # quick | standard | deep
+  depth: standard
+  concurrency: 50
+  timeout: 30
+  wordlist: ""      # leave blank → use bundled list
+  resolvers: ""     # leave blank → use configs/resolvers.txt
+
+output:
+  directory: "reports"
+  formats:
+    - json
+    - txt
+    - html
+
+features:
+  dns_history:   true
+  http_probe:    true
+  risk_scoring:  true
+  whois:         true
+
+# Optional API keys — unlock more data sources.
+# Prefer env vars. Never commit real keys.
+api_keys:
+  securitytrails: ""
+  virustotal:     ""
+  shodan:         ""
+  censys_id:      ""
+  censys_secret:  ""
+  github:         ""
+
+logging:
+  level: WARNING    # DEBUG | INFO | WARNING | ERROR
+  file:  ""
